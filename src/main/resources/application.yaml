@@ -1,3 +1,10 @@
+tomcat:
+  threads:
+    max: 200 # Mặc định
+    min-spare: 20
+  accept-count: 5000 # Hàng đợi TCP khi full thread (Quan trọng khi burst traffic)
+  max-connections: 20000 # Cho phép 20k kết nối (QUAN TRỌNG)
+
 spring:
   application:
     name: migrate

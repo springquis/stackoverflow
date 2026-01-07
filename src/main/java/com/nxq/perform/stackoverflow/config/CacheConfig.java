@@ -12,6 +12,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 
 import java.util.concurrent.TimeUnit;
@@ -38,39 +39,31 @@ public class CacheConfig {
                 .build();
     }
 
+    /**
+     * KEY CHỐT HẠ: Template này chuyên trị byte[].
+     * Nó giúp Redis trả về data thô, không tốn CPU để parse ra Object.
+     */
     @Bean
-    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
+    public RedisTemplate<String, byte[]> byteRedisTemplate(RedisConnectionFactory connectionFactory) {
+        RedisTemplate<String, byte[]> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
 
-        // Key Serializer
-        StringRedisSerializer stringSerializer = new StringRedisSerializer();
-        template.setKeySerializer(stringSerializer);
-        template.setHashKeySerializer(stringSerializer);
+        // Key vẫn là String cho dễ đọc
+        template.setKeySerializer(new StringRedisSerializer());
 
-        // --- PHẦN SỬA LỖI Ở ĐÂY ---
-        ObjectMapper mapper = new ObjectMapper();
+        // Value là Byte Array (Copy thẳng từ Redis ra RAM, CPU không cần làm việc)
+        template.setValueSerializer(RedisSerializer.byteArray());
 
-        // 1. Đăng ký Module để Jackson hiểu LocalDateTime
-        mapper.registerModule(new JavaTimeModule());
-
-        // 2. (Tùy chọn) Lưu ngày tháng dạng chuỗi "2023-12-27T10:00:00" thay vì array số
-        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-
-        // 3. Cấu hình để lưu thông tin Class (giúp deserialize ngược lại đúng kiểu List)
-        mapper.activateDefaultTyping(
-                LaissezFaireSubTypeValidator.instance,
-                ObjectMapper.DefaultTyping.NON_FINAL,
-                JsonTypeInfo.As.PROPERTY
-        );
-
-        GenericJackson2JsonRedisSerializer jsonSerializer = new GenericJackson2JsonRedisSerializer(mapper);
-        // ---------------------------
-
-        template.setValueSerializer(jsonSerializer);
-        template.setHashValueSerializer(jsonSerializer);
-
-        template.afterPropertiesSet();
         return template;
+    }
+
+    /**
+     * ObjectMapper sạch để serialize DTO -> JSON Bytes thủ công
+     */
+    @Bean
+    public ObjectMapper simpleObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        return mapper;
     }
 }

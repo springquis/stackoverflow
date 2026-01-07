@@ -1,27 +1,26 @@
 package com.nxq.perform.stackoverflow.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.nxq.perform.stackoverflow.dto.PostSummaryDto;
 import com.nxq.perform.stackoverflow.entity.es.PostEs;
-import com.nxq.perform.stackoverflow.repository.PostEsRepository;
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.codec.digest.DigestUtils;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Sort;
 import org.springframework.data.elasticsearch.client.elc.NativeQuery;
 import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.SearchHits;
-import org.springframework.data.elasticsearch.core.query.Query;
+import org.springframework.data.elasticsearch.core.query.FetchSourceFilter;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import co.elastic.clients.elasticsearch._types.query_dsl.ChildScoreMode;
 
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
@@ -31,180 +30,101 @@ import java.util.stream.Collectors;
 @Slf4j
 public class PostSearchService {
 
-    private final PostEsRepository postEsRepository;
-    private final ElasticsearchOperations elasticsearchOperations; // Dùng cho Query phức tạp (MLT)
-    private final RedisTemplate<String, Object> redisTemplate;
+    // Inject ElasticsearchOperations thay vì Repository cho các query phức tạp
+    private final ElasticsearchOperations elasticsearchOperations;
+    private final RedisTemplate<String, byte[]> byteRedisTemplate;
+    private final ObjectMapper objectMapper;
 
-    @Qualifier("localSearchCache")
-    private final Cache<String, Object> localCache;
+    // L1 Cache: Lưu thẳng byte[] trên Heap
+    private final Cache<String, byte[]> localCache = Caffeine.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(Duration.ofSeconds(60))
+            .build();
 
-    // Executor ảo cho tác vụ lưu cache ngầm
+    private static final String CACHE_PREFIX = "s:kw:";
     private final ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
-    private static final String KEYWORD_PREFIX = "search:kw:";
-    private static final String MLT_PREFIX = "search:mlt:";
-    private static final String TRENDING_KEY = "search:trending";
+    public byte[] search(String keyword) {
+        if (keyword == null || keyword.isBlank()) return new byte[0];
 
+        String key = CACHE_PREFIX + DigestUtils.sha256Hex(keyword.trim().toLowerCase());
 
-    // CHIẾN LƯỢC 1: FULL-TEXT SEARCH (TÌM THEO TỪ KHÓA)
-    @CircuitBreaker(name = "esSearch", fallbackMethod = "fallbackSearchByKeyword")
-    @SuppressWarnings("unchecked")
-    public List<PostEs> searchByKeyword(String keyword) {
-        if (keyword == null || keyword.isBlank()) return Collections.emptyList();
-
-        // 1. Check Cache (L1 -> L2)
-        String cacheKey = KEYWORD_PREFIX + DigestUtils.sha256Hex(keyword.trim().toLowerCase());
-        List<PostEs> cached = getFromCache(cacheKey);
-        if (cached != null) return cached;
-
-        log.info("[Strategy 1] Searching ES for keyword: {}", keyword);
-
-        // 2. Query Elasticsearch (Thông qua Repository bạn đã viết)
-        List<PostEs> results = postEsRepository.searchByKeyword(keyword);
-
-        // 3. Update Cache Async
-        updateCacheAsync(cacheKey, results);
-
-        return results;
-    }
-
-    // CHIẾN LƯỢC 2: MORE LIKE THIS (TÌM BÀI VIẾT TƯƠNG TỰ)
-    @CircuitBreaker(name = "esSearch", fallbackMethod = "fallbackMoreLikeThis")
-    @SuppressWarnings("unchecked")
-    public List<PostEs> findMoreLikeThis(Long postId) {
-        if (postId == null) return Collections.emptyList();
-
-        // 1. Check Cache
-        String cacheKey = MLT_PREFIX + postId;
-        List<PostEs> cached = getFromCache(cacheKey);
-        if (cached != null) return cached;
-
-        log.info("[Strategy 2] Finding similar posts for ID: {}", postId);
-
-        // 2. Build Query More Like This (Spring Boot 3 / ES 8 client)
-        // Tìm các bài viết có nội dung (title, body) giống với bài postId
-        Query query = NativeQuery.builder()
-                .withQuery(q -> q
-                        .moreLikeThis(mlt -> mlt
-                                .like(l -> l.document(d -> d.index("post_es").id(String.valueOf(postId))))
-                                .fields("title", "body") // So sánh dựa trên tiêu đề và nội dung
-                                .minTermFreq(1)          // Tần suất từ xuất hiện tối thiểu
-                                .minDocFreq(1)           // Tần suất document tối thiểu
-                                .maxQueryTerms(12)       // Giới hạn số từ khóa dùng để so sánh (để đỡ nặng)
-                        )
-                )
-                .withPageable(PageRequest.of(0, 10)) // Lấy 10 bài tương tự nhất
-                .build();
-
-        SearchHits<PostEs> searchHits = elasticsearchOperations.search(query, PostEs.class);
-        List<PostEs> results = searchHits.stream()
-                .map(org.springframework.data.elasticsearch.core.SearchHit::getContent)
-                .collect(Collectors.toList());
-
-        // 3. Update Cache
-        updateCacheAsync(cacheKey, results);
-
-        return results;
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<PostEs> getFromCache(String key) {
-        // Check L1
-        List<PostEs> l1 = (List<PostEs>) localCache.getIfPresent(key);
+        // 1. L1 Cache
+        byte[] l1 = localCache.getIfPresent(key);
         if (l1 != null) return l1;
 
-        // Check L2
-        try {
-            List<PostEs> l2 = (List<PostEs>) redisTemplate.opsForValue().get(key);
-            if (l2 != null) {
-                localCache.put(key, l2); // Promote to L1
-                return l2;
-            }
-        } catch (Exception e) {
-            log.warn("Redis error (L2 missed): {}", e.getMessage());
+        // 2. Redis Cache
+        byte[] l2 = byteRedisTemplate.opsForValue().get(key);
+        if (l2 != null) {
+            localCache.put(key, l2);
+            return l2;
         }
-        return null;
+
+        // 3. Cache Miss -> Query ES Direct
+        return fetchFromElasticAndCache(keyword, key);
     }
 
-    private void updateCacheAsync(String key, List<PostEs> data) {
-        if (data == null || data.isEmpty()) return;
-
-        CompletableFuture.runAsync(() -> {
-            try {
-                localCache.put(key, data);
-                redisTemplate.opsForValue().set(key, data, Duration.ofHours(1));
-            } catch (Exception e) {
-                log.error("Cache update failed", e);
-            }
-        }, virtualExecutor);
-    }
-
-    // --- FALLBACK METHODS
-    @Scheduled(fixedRate = 600000)
-    public void refreshTrendingPosts() {
-        log.info("Refreshing Trending Posts Cache...");
+    private byte[] fetchFromElasticAndCache(String keyword, String key) {
         try {
-            // Query lấy top 20 bài có score cao nhất (Sort DESC)
-            Query query = NativeQuery.builder()
-                    .withQuery(q -> q.matchAll(m -> m))
-                    .withSort(Sort.by(Sort.Direction.DESC, "score"))
-                    .withPageable(PageRequest.of(0, 20))
+            // --- FIX: Dùng class cụ thể 'NativeQuery' thay vì interface 'Query' chung chung ---
+            NativeQuery nativeQuery = NativeQuery.builder()
+                    .withSourceFilter(new FetchSourceFilter(new String[]{"id", "title"}, null))
+                    .withQuery(q -> q.bool(b -> b
+                            .should(s -> s.multiMatch(m -> m
+                                    .query(keyword)
+                                    .fields("title^3", "body_text")
+                                    .fuzziness("AUTO")
+                            ))
+                            .should(s -> s.term(t -> t
+                                    .field("tags")
+                                    .value(keyword)
+                                    .caseInsensitive(true)
+                            ))
+                            .should(s -> s.nested(n -> n
+                                    .path("comments")
+                                    .query(nq -> nq.match(m -> m
+                                            .field("comments.text")
+                                            .query(keyword)
+                                    ))
+                                    .scoreMode(ChildScoreMode.Max)
+                            ))
+                    ))
+                    .withPageable(PageRequest.of(0, 5))
                     .build();
 
-            SearchHits<PostEs> hits = elasticsearchOperations.search(query, PostEs.class);
-            List<PostEs> trendingPosts = hits.stream()
-                    .map(org.springframework.data.elasticsearch.core.SearchHit::getContent)
+            // Lúc này nativeQuery đã đúng kiểu mà search() cần
+            SearchHits<PostEs> searchHits = elasticsearchOperations.search(nativeQuery, PostEs.class);
+
+            if (!searchHits.hasSearchHits()) {
+                return "[]".getBytes();
+            }
+
+            List<PostSummaryDto> dtos = searchHits.stream()
+                    .map(hit -> {
+                        PostEs e = hit.getContent();
+                        String title = e.getTitle() != null ? e.getTitle() : "";
+                        String slug = title.toLowerCase().trim()
+                                .replaceAll("[^a-z0-9\\s-]", "").replaceAll("\\s+", "-");
+                        return new PostSummaryDto(e.getId(), title, slug);
+                    })
                     .collect(Collectors.toList());
 
-            if (!trendingPosts.isEmpty()) {
-                // 1. Lưu vào Redis (TTL dài: 1 ngày để an toàn)
-                redisTemplate.opsForValue().set(TRENDING_KEY, trendingPosts, Duration.ofDays(1));
+            byte[] jsonBytes = objectMapper.writeValueAsBytes(dtos);
 
-                // 2. Lưu vào Local Cache ngay lập tức
-                localCache.put(TRENDING_KEY, trendingPosts);
+            virtualExecutor.submit(() -> {
+                try {
+                    localCache.put(key, jsonBytes);
+                    byteRedisTemplate.opsForValue().set(key, jsonBytes, Duration.ofMinutes(30));
+                } catch (Exception ex) {
+                    log.error("Cache update failed", ex);
+                }
+            });
 
-                log.info("Trending Posts updated successfully: {} items", trendingPosts.size());
-            }
+            return jsonBytes;
+
         } catch (Exception e) {
-            log.error("Failed to refresh Trending Posts", e);
+            log.error("ES Error: {}", e.getMessage());
+            return new byte[0];
         }
     }
-
-    // FALLBACK METHODS (TRẢ VỀ HOT SEARCH TỪ CACHE)
-
-    public List<PostEs> fallbackSearchByKeyword(String keyword, Throwable t) {
-        log.error("⚠️ Circuit Breaker OPEN for Keyword: '{}'. Reason: {}. Returning TRENDING POSTS.", keyword, t.getMessage());
-        return getTrendingPosts();
-    }
-
-    public List<PostEs> fallbackMoreLikeThis(Long postId, Throwable t) {
-        log.error("⚠️ Circuit Breaker OPEN for MLT ID: '{}'. Reason: {}. Returning TRENDING POSTS.", postId, t.getMessage());
-        return getTrendingPosts();
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<PostEs> getTrendingPosts() {
-        // 1. Thử lấy từ Local Cache (Cực nhanh)
-        List<PostEs> localTrending = (List<PostEs>) localCache.getIfPresent(TRENDING_KEY);
-        if (localTrending != null && !localTrending.isEmpty()) {
-            return localTrending;
-        }
-
-        // 2. Nếu Local không có (ví dụ mới restart app), lấy từ Redis
-        try {
-            List<PostEs> redisTrending = (List<PostEs>) redisTemplate.opsForValue().get(TRENDING_KEY);
-            if (redisTrending != null && !redisTrending.isEmpty()) {
-                // Đẩy ngược lại vào Local Cache để lần sau nhanh hơn
-                localCache.put(TRENDING_KEY, redisTrending);
-                return redisTrending;
-            }
-        } catch (Exception e) {
-            log.error("Failed to fetch trending from Redis", e);
-        }
-
-        // 3. Nếu cả 2 đều không có -> Chấp nhận trả về rỗng
-        return Collections.emptyList();
-    }
-
-
 }
